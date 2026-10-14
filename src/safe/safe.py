@@ -14,7 +14,10 @@ if hasattr(sys.stdout, 'reconfigure'):
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import RobustScaler, StandardScaler
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.metrics import roc_auc_score
+import pickle
 
 import torch
 import torch.nn as nn
@@ -95,6 +98,125 @@ MASK_RATIO = 0.20
 # Fallback: if validation-based threshold fails,
 # use this percentile on normal reconstruction errors
 THRESHOLD_PERCENTILE = 95
+
+# Architecture / loss defaults (used when no tuned config exists)
+LATENT_DIM = 32
+DROPOUT = 0.1
+LOSS = "huber"            # "huber" (SmoothL1) or "mse"
+
+# Anomaly scorer on top of the trained autoencoder:
+#   "recon"      - mean squared reconstruction error
+#   "latent_lof" - Local Outlier Factor on the encoder's latent features
+#                  (the novelty-detector design of the original SAFE paper)
+#   "hybrid"     - LOF on [latent features, log reconstruction error]
+#   "auto"       - pick the best of the above on VALIDATION ROC-AUC
+SCORER = "auto"
+LOF_NEIGHBORS = [10, 20, 50]     # candidates tried by "auto"
+LOF_MAX_FIT = 20000              # benign flows used to fit LOF
+SCORER_TOLERANCE = 0.002         # simpler scorer kept if within this AUC
+
+# Upper bound on the false-positive rate on benign VALIDATION flows when
+# choosing the threshold (a SOC cannot act on mostly-false alarms).
+MAX_VALIDATION_FPR = 0.05
+
+# Validation ROC-AUC above which the score distributions count as "well
+# separated" (Youden's J); 0.76 = Phi(1/sqrt(2)), i.e. Cohen's d = 1.
+SEPARATION_AUC = 0.76
+
+# Columns that encode the label itself and must never be features.
+# In IoMT-TrafficData, 'traffic' is the attack-type name label-encoded.
+LEAKY_COLUMNS = {"traffic", "label", "Label", "is_attack", "attack_type", "Attack Type"}
+
+TUNING_DIR = os.path.join(PROJECT_ROOT, "results", "tuning")
+
+# Final per-dataset hyperparameters, chosen on VALIDATION ROC-AUC in the
+# tune_safe.py --quick study (1 seed, epochs evaluated 1..40).
+#
+# IoMT-TrafficData: all settings reach val ROC-AUC ~0.999 (saturated), so the
+#   defaults are kept. 30 epochs: early stopping on validation loss stops at
+#   epoch 29; more epochs add training time without improving detection.
+# MedSec-25: a LIST of mask ratios means "train one model per ratio and keep
+#   the one whose selected scorer has the best VALIDATION ROC-AUC".
+#   (With reconstruction scoring, mask 0.0 was best: 0.766 vs 0.705; with
+#   encoder+LOF scoring the comparison ablation suggested masking helps, so
+#   the ratio is re-selected on validation instead of fixed.)
+# Earlier quick study, reconstruction scoring: mask_ratio 0.0 beats 0.2 on validation (0.766 vs 0.705) and on
+#   test (0.695 vs 0.655). Epoch study selected 38 epochs (early stop at 39).
+#   lr 0.003 was NOT adopted: +0.01 on validation but -0.06 on test (unstable).
+FINAL_CONFIGS = {
+    "IoMT-TrafficData": {
+        "epochs": 30,
+        "mask_ratio": 0.2,
+        "lr": 5e-4,
+        "batch_size": 128,
+        "latent": 32,
+        "dropout": 0.1,
+        "loss": "huber",
+        "scorer": "auto"
+    },
+    "MedSec-25": {
+        "epochs": 38,
+        "mask_ratio": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.7],   # chosen on validation together with the scorer
+        "lr": 5e-4,
+        "batch_size": 128,
+        "latent": 32,
+        "dropout": 0.1,
+        "loss": "huber",
+        "scorer": "auto"
+    }
+}
+
+
+# ============================================================
+# PER-DATASET HYPERPARAMETERS (from tune_safe.py)
+# ============================================================
+
+def load_safe_config(dataset_name):
+    """
+    Default hyperparameters, overridden by the validation-selected
+    configuration in results/tuning/<dataset>/best_config.json
+    (written by src/evaluation/tune_safe.py). Configs from --quick
+    tuning runs (single seed) are ignored.
+    """
+
+    config = {
+        "epochs": EPOCHS,
+        "mask_ratio": MASK_RATIO,
+        "lr": LEARNING_RATE,
+        "batch_size": BATCH_SIZE,
+        "latent": LATENT_DIM,
+        "dropout": DROPOUT,
+        "loss": LOSS,
+        "scorer": SCORER,
+        "source": "safe.py defaults"
+    }
+
+    if dataset_name in FINAL_CONFIGS:
+
+        config.update(FINAL_CONFIGS[dataset_name])
+        config["source"] = "FINAL_CONFIGS in safe.py (quick tuning study)"
+
+    path = os.path.join(TUNING_DIR, dataset_name, "best_config.json")
+
+    if os.path.exists(path):
+
+        with open(path, "r", encoding="utf-8") as file:
+            saved = json.load(file)
+
+        is_quick = saved.get("quick", len(saved.get("seeds", [])) < 2)
+
+        if is_quick:
+            print(
+                f"\nNOTE: {path} comes from a --quick tuning run; "
+                "ignoring it and using safe.py defaults."
+            )
+        else:
+            tuned = dict(saved["tuned_config"])
+            tuned.pop("scorer", None)   # scorer is chosen on validation by select_scorer
+            config.update(tuned)
+            config["source"] = path
+
+    return config
 
 
 # ============================================================
@@ -711,13 +833,13 @@ def load_attack_validation_data(
         + [label_column]
     )
 
-    attack_parts = []
+    # Uniform random sample over ALL attack rows in the file
+    # (keeps the attack-class mix representative; the previous
+    # version took the first rows only, which in a class-ordered
+    # CSV means one or two attack types).
+    rng = np.random.default_rng(RANDOM_SEED)
 
-    total_attack = 0
-
-    # --------------------------------------------------------
-    # Chunked reading
-    # --------------------------------------------------------
+    kept = None
 
     for chunk in pd.read_csv(
         train_path,
@@ -728,33 +850,26 @@ def load_attack_validation_data(
 
         attack_chunk = chunk[
             chunk[label_column] != normal_label
-        ]
+        ][selected_columns].copy()
 
-        if len(
-            attack_chunk
-        ) == 0:
+        if len(attack_chunk) == 0:
 
             continue
 
-        attack_parts.append(
-            attack_chunk[
-                selected_columns
-            ]
+        attack_chunk["_r"] = rng.random(
+            len(attack_chunk)
         )
 
-        total_attack += len(
-            attack_chunk
-        )
-
-        if total_attack >= max_samples:
-
-            break
+        kept = (
+            attack_chunk if kept is None
+            else pd.concat([kept, attack_chunk], ignore_index=True)
+        ).nsmallest(max_samples, "_r")
 
     # --------------------------------------------------------
     # Verify
     # --------------------------------------------------------
 
-    if not attack_parts:
+    if kept is None or len(kept) == 0:
 
         print(
             "WARNING: No attack validation "
@@ -763,24 +878,11 @@ def load_attack_validation_data(
 
         return None
 
-    # --------------------------------------------------------
-    # Combine, sample, and convert
-    # --------------------------------------------------------
-
-    X_attack = pd.concat(
-        attack_parts,
-        ignore_index=True
+    X_attack = kept.drop(
+        columns=["_r"]
+    ).reset_index(
+        drop=True
     )
-
-    # Randomly sample to max_samples
-    if len(X_attack) > max_samples:
-
-        X_attack = X_attack.sample(
-            n=max_samples,
-            random_state=RANDOM_SEED
-        ).reset_index(
-            drop=True
-        )
 
     X_attack = X_attack.apply(
         pd.to_numeric,
@@ -817,7 +919,8 @@ def load_test_data(
     selected_columns,
     label_column,
     normal_label,
-    max_samples
+    max_samples,
+    return_index=False
 ):
     """
     Load test data with STRATIFIED sampling.
@@ -1003,7 +1106,13 @@ def load_test_data(
     test_df = test_df.sample(
         frac=1.0,
         random_state=RANDOM_SEED
-    ).reset_index(
+    )
+
+    # Row number of each sampled flow in test.csv (0-based, data rows).
+    # M4 uses it to look up the real flow record for each prediction.
+    test_row_index = test_df.index.to_numpy()
+
+    test_df = test_df.reset_index(
         drop=True
     )
 
@@ -1067,7 +1176,75 @@ def load_test_data(
             f"{c:,}"
         )
 
+    if return_index:
+
+        return X_test, y_test, test_row_index
+
     return X_test, y_test
+
+
+# ============================================================
+# PER-FEATURE EXPLANATION
+# ============================================================
+
+def per_feature_errors(
+    model,
+    X
+):
+    """Squared reconstruction error per feature, shape (n_samples, n_features)."""
+
+    model.eval()
+
+    out = []
+
+    with torch.no_grad():
+
+        for i in range(0, len(X), 4096):
+
+            batch = torch.tensor(
+                X[i:i + 4096],
+                dtype=torch.float32
+            )
+
+            out.append(
+                ((model(batch) - batch) ** 2).numpy()
+            )
+
+    return np.concatenate(out)
+
+
+def explain_predictions(
+    model,
+    X_test,
+    X_normal_val,
+    feature_names,
+    top_k=5
+):
+    """
+    For every test flow, the top-k features whose reconstruction error is
+    largest relative to the average error on normal validation traffic.
+    Returned as JSON strings: [[feature, error_vs_normal], ...].
+    """
+
+    baseline = per_feature_errors(
+        model,
+        X_normal_val
+    ).mean(axis=0) + 1e-9
+
+    ratios = per_feature_errors(
+        model,
+        X_test
+    ) / baseline
+
+    top = np.argsort(-ratios, axis=1)[:, :top_k]
+
+    return [
+        json.dumps([
+            [feature_names[j], round(float(ratios[i, j]), 2)]
+            for j in top[i]
+        ])
+        for i in range(len(X_test))
+    ]
 
 
 # ============================================================
@@ -1109,7 +1286,9 @@ class MaskedAutoencoder(
 
     def __init__(
         self,
-        input_dim
+        input_dim,
+        latent_dim=32,
+        dropout=0.1
     ):
 
         super().__init__()
@@ -1125,7 +1304,7 @@ class MaskedAutoencoder(
 
             nn.ReLU(),
 
-            nn.Dropout(0.1),
+            nn.Dropout(dropout),
 
             nn.Linear(
                 128,
@@ -1136,11 +1315,11 @@ class MaskedAutoencoder(
 
             nn.ReLU(),
 
-            nn.Dropout(0.1),
+            nn.Dropout(dropout),
 
             nn.Linear(
                 64,
-                32
+                latent_dim
             ),
 
             nn.ReLU()
@@ -1149,7 +1328,7 @@ class MaskedAutoencoder(
         self.decoder = nn.Sequential(
 
             nn.Linear(
-                32,
+                latent_dim,
                 64
             ),
 
@@ -1157,7 +1336,7 @@ class MaskedAutoencoder(
 
             nn.ReLU(),
 
-            nn.Dropout(0.1),
+            nn.Dropout(dropout),
 
             nn.Linear(
                 64,
@@ -1201,7 +1380,8 @@ class MaskedAutoencoder(
 
 def train_safe_model(
     X_train,
-    input_dim
+    input_dim,
+    config
 ):
     """
     Train SAFE using normal traffic only.
@@ -1218,7 +1398,9 @@ def train_safe_model(
     )
 
     model = MaskedAutoencoder(
-        input_dim
+        input_dim,
+        latent_dim=config["latent"],
+        dropout=config["dropout"]
     )
 
     model = model.to(
@@ -1227,14 +1409,17 @@ def train_safe_model(
 
     optimizer = torch.optim.Adam(
         model.parameters(),
-        lr=LEARNING_RATE,
+        lr=config["lr"],
         weight_decay=1e-5
     )
 
     # Huber loss (SmoothL1) is more robust
     # than MSE for features with occasional
     # outlier values
-    loss_function = nn.SmoothL1Loss()
+    loss_function = (
+        nn.MSELoss() if config["loss"] == "mse"
+        else nn.SmoothL1Loss()
+    )
 
     X_tensor = torch.tensor(
         X_train,
@@ -1247,19 +1432,22 @@ def train_safe_model(
 
     loader = DataLoader(
         dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=config["batch_size"],
         shuffle=True,
-        num_workers=0
+        num_workers=0,
+        drop_last=True
     )
 
     print(
         f"\nTraining SAFE for "
-        f"{EPOCHS} epochs..."
+        f"{config['epochs']} epochs "
+        f"(mask ratio {config['mask_ratio']}, lr {config['lr']}, "
+        f"batch {config['batch_size']}, loss {config['loss']})..."
     )
 
     print(
         f"Architecture: {input_dim} -> 128 -> "
-        f"64 -> 32 -> 64 -> 128 -> {input_dim}"
+        f"64 -> {config['latent']} -> 64 -> 128 -> {input_dim}"
     )
 
     print(
@@ -1268,9 +1456,11 @@ def train_safe_model(
 
     model.train()
 
+    epochs = config["epochs"]
+
     for epoch in range(
         1,
-        EPOCHS + 1
+        epochs + 1
     ):
 
         total_loss = 0.0
@@ -1289,7 +1479,7 @@ def train_safe_model(
 
             mask = (
                 torch.rand_like(batch)
-                < MASK_RATIO
+                < config["mask_ratio"]
             )
 
             # ------------------------------------------------
@@ -1350,7 +1540,7 @@ def train_safe_model(
 
             print(
                 f"Epoch "
-                f"[{epoch:02d}/{EPOCHS}] "
+                f"[{epoch:02d}/{epochs}] "
                 f"Loss: "
                 f"{average_loss:.6f}"
             )
@@ -1426,6 +1616,212 @@ def reconstruction_errors(
 # ============================================================
 # THRESHOLD — VALIDATION-BASED (Youden's J)
 # ============================================================
+
+# ============================================================
+# ANOMALY SCORERS ON TOP OF THE AUTOENCODER
+# ============================================================
+
+def latent_features(
+    model,
+    X
+):
+    """Encoder output (latent representation) for every row of X."""
+
+    model.eval()
+
+    out = []
+
+    with torch.no_grad():
+
+        for i in range(0, len(X), 4096):
+
+            batch = torch.tensor(
+                X[i:i + 4096],
+                dtype=torch.float32
+            )
+
+            out.append(
+                model.encoder(batch).numpy()
+            )
+
+    return np.concatenate(out)
+
+
+class SAFEScorer:
+    """
+    Turns a trained autoencoder into an anomaly scorer.
+    Higher score = more anomalous.
+    """
+
+    def __init__(
+        self,
+        model,
+        kind="recon",
+        n_neighbors=20
+    ):
+
+        self.model = model
+        self.kind = kind
+        self.n_neighbors = n_neighbors
+        self.lof = None
+        self.scaler = None
+
+    def _lof_input(
+        self,
+        X
+    ):
+
+        z = latent_features(
+            self.model,
+            X
+        )
+
+        if self.kind == "hybrid":
+
+            err = np.log10(
+                reconstruction_errors(self.model, X) + 1e-9
+            ).reshape(-1, 1)
+
+            z = np.hstack([z, err])
+
+        return z
+
+    def fit(
+        self,
+        X_train,
+        seed=RANDOM_SEED
+    ):
+
+        if self.kind == "recon":
+
+            return self
+
+        if len(X_train) > LOF_MAX_FIT:
+
+            idx = np.random.default_rng(seed).choice(
+                len(X_train),
+                LOF_MAX_FIT,
+                replace=False
+            )
+
+            X_train = X_train[idx]
+
+        Z = self._lof_input(X_train)
+
+        self.scaler = StandardScaler().fit(Z)
+
+        self.lof = LocalOutlierFactor(
+            n_neighbors=self.n_neighbors,
+            novelty=True,
+            n_jobs=-1
+        ).fit(
+            self.scaler.transform(Z)
+        )
+
+        return self
+
+    def score(
+        self,
+        X
+    ):
+
+        if self.kind == "recon":
+
+            return reconstruction_errors(
+                self.model,
+                X
+            )
+
+        Z = self.scaler.transform(
+            self._lof_input(X)
+        )
+
+        # score_samples is the negative LOF; negate so higher = more anomalous
+        return (-self.lof.score_samples(Z)).astype(np.float32)
+
+    @property
+    def name(self):
+
+        if self.kind == "recon":
+
+            return "recon"
+
+        return f"{self.kind}(k={self.n_neighbors})"
+
+
+def select_scorer(
+    model,
+    X_train,
+    X_val_normal,
+    X_val_attack,
+    requested="auto"
+):
+    """
+    Choose the anomaly scorer on VALIDATION ROC-AUC only.
+    A simpler scorer (recon < latent_lof < hybrid) is kept unless a more
+    complex one improves validation ROC-AUC by more than SCORER_TOLERANCE.
+    """
+
+    if requested != "auto":
+
+        chosen = SAFEScorer(model, requested, LOF_NEIGHBORS[1]).fit(X_train)
+
+        table = []
+
+        if X_val_attack is not None and len(X_val_attack) > 0:
+
+            s = np.r_[chosen.score(X_val_normal), chosen.score(X_val_attack)]
+            y = np.r_[np.zeros(len(X_val_normal)), np.ones(len(X_val_attack))]
+            table = [{"scorer": chosen.name, "val_roc_auc": round(float(roc_auc_score(y, s)), 4)}]
+
+        return chosen, table
+
+    if X_val_attack is None or len(X_val_attack) == 0:
+
+        print("\nNo attack validation data: using reconstruction scorer.")
+
+        return SAFEScorer(model, "recon"), []
+
+    candidates = [SAFEScorer(model, "recon")]
+
+    for kind in ("latent_lof", "hybrid"):
+
+        for k in LOF_NEIGHBORS:
+
+            candidates.append(SAFEScorer(model, kind, k))
+
+    y_val = np.r_[
+        np.zeros(len(X_val_normal)),
+        np.ones(len(X_val_attack))
+    ]
+
+    print("\nSelecting anomaly scorer on validation ROC-AUC...")
+
+    table = []
+
+    for c in candidates:
+
+        c.fit(X_train)
+
+        s = np.r_[c.score(X_val_normal), c.score(X_val_attack)]
+
+        auc = float(roc_auc_score(y_val, s))
+
+        table.append({"scorer": c.name, "val_roc_auc": round(auc, 4)})
+
+        print(f"  {c.name:<18} validation ROC-AUC {auc:.4f}")
+
+    best_auc = max(r["val_roc_auc"] for r in table)
+
+    # candidates are ordered simplest first
+    for c, r in zip(candidates, table):
+
+        if r["val_roc_auc"] >= best_auc - SCORER_TOLERANCE:
+
+            print(f"Selected scorer: {c.name}")
+
+            return c, table
+
 
 def calculate_threshold_validation(
     normal_errors,
@@ -1504,9 +1900,20 @@ def calculate_threshold_validation(
     # Find optimal thresholds for Youden J and Max F1
     # --------------------------------------------------------
 
+    # Lowest threshold that keeps validation FPR within the cap; used as the
+    # fallback and as the lower bound for all candidates.
+    fpr_floor = float(
+        np.percentile(normal_errors, 100.0 * (1.0 - MAX_VALIDATION_FPR))
+    )
+
+    candidates = candidates[candidates >= fpr_floor]
+
+    if len(candidates) == 0:
+        candidates = np.array([fpr_floor])
+
     best_j = -1.0
-    thresh_youden = float(np.percentile(normal_errors, THRESHOLD_PERCENTILE))
-    
+    thresh_youden = fpr_floor
+
     best_f1 = -1.0
     thresh_f1 = thresh_youden
 
@@ -1551,15 +1958,26 @@ def calculate_threshold_validation(
     # Adaptive threshold selection
     # --------------------------------------------------------
 
-    if cohen_d >= 1.0:
+    # Separation is measured with the validation ROC-AUC, which is scale-free
+    # (Cohen's d breaks down on heavy-tailed scores such as LOF). Under the
+    # equal-variance binormal model AUC = Phi(d / sqrt(2)), so AUC >= 0.76
+    # corresponds to the original rule d >= 1.
+    from scipy.stats import norm
+    val_auc = float(roc_auc_score(y_val, scores_val))
+    d_equiv = float(np.sqrt(2.0) * norm.ppf(min(max(val_auc, 1e-6), 1 - 1e-6)))
+
+    if val_auc >= SEPARATION_AUC:
         best_threshold = thresh_youden
-        strategy = f"Youden's J (Cohen's d = {cohen_d:.2f} >= 1.0)"
+        strategy = (f"Youden's J (validation AUC = {val_auc:.3f} >= {SEPARATION_AUC}, "
+                    f"equivalent d = {d_equiv:.2f})")
     else:
         best_threshold = thresh_f1
-        strategy = f"Validation Max F1 (Cohen's d = {cohen_d:.2f} < 1.0)"
+        strategy = (f"Validation Max F1 (validation AUC = {val_auc:.3f} < {SEPARATION_AUC}, "
+                    f"equivalent d = {d_equiv:.2f})")
 
     print(
-        f"Threshold selection strategy: {strategy}"
+        f"Threshold selection strategy: {strategy}, "
+        f"validation FPR capped at {MAX_VALIDATION_FPR:.0%}"
     )
 
     print(
@@ -1609,7 +2027,7 @@ def print_score_statistics(
     )
 
     print(
-        "Reconstruction Error Statistics"
+        "Anomaly Score Statistics"
     )
 
     print(
@@ -1617,7 +2035,7 @@ def print_score_statistics(
     )
 
     print(
-        "\nNormal traffic reconstruction errors:"
+        "\nNormal traffic anomaly scores:"
     )
 
     print(
@@ -1655,7 +2073,7 @@ def print_score_statistics(
     )
 
     print(
-        "\nAttack traffic reconstruction errors:"
+        "\nAttack traffic anomaly scores:"
     )
 
     print(
@@ -1763,9 +2181,9 @@ def evaluate_safe(
         "\nCalculating anomaly scores..."
     )
 
-    scores = reconstruction_errors(
-        model,
-        X_test
+    scores = (
+        model.score(X_test) if isinstance(model, SAFEScorer)
+        else reconstruction_errors(model, X_test)
     )
 
     predictions = (
@@ -2049,6 +2467,44 @@ def evaluate_safe(
         f"PR-AUC:      {pr_auc:.4f}"
     )
 
+    extra = imbalance_aware_metrics(
+        true_positive, false_positive, true_negative, false_negative
+    )
+
+    print(
+        "\nFlag rate per original class "
+        "(normal class = false-positive rate; others = detection rate):"
+    )
+
+    for label_value in np.unique(y_test):
+
+        mask = (y_test == label_value)
+
+        kind = "normal" if label_value == normal_label else "attack"
+
+        print(
+            f"  Label {label_value} ({kind}): "
+            f"{predictions[mask].mean():.4f} of {int(mask.sum()):,} flows flagged"
+        )
+
+    print(
+        f"FPR:         {extra['false_positive_rate']:.4f}"
+    )
+
+    print(
+        f"Balanced accuracy: {extra['balanced_accuracy']:.4f}"
+    )
+
+    print(
+        f"MCC:         {extra['mcc']:.4f}"
+    )
+
+    print(
+        f"\nTrivial baseline (flag every flow as attack): "
+        f"accuracy {extra['baseline_all_attack_accuracy']:.4f}, "
+        f"F1 {extra['baseline_all_attack_f1']:.4f}"
+    )
+
     return (
         scores,
         predictions,
@@ -2060,6 +2516,32 @@ def evaluate_safe(
         roc_auc,
         pr_auc
     )
+
+
+# ============================================================
+# IMBALANCE-AWARE METRICS
+# ============================================================
+
+def imbalance_aware_metrics(
+    tp,
+    fp,
+    tn,
+    fn
+):
+    tpr = tp / max(tp + fn, 1)
+    tnr = tn / max(tn + fp, 1)
+    denom = np.sqrt(float(tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+    mcc = ((tp * tn) - (fp * fn)) / denom if denom > 0 else 0.0
+    pos_share = (tp + fn) / max(tp + fp + tn + fn, 1)
+
+    return {
+        "specificity": float(tnr),
+        "false_positive_rate": float(1.0 - tnr),
+        "balanced_accuracy": float((tpr + tnr) / 2.0),
+        "mcc": float(mcc),
+        "baseline_all_attack_accuracy": float(pos_share),
+        "baseline_all_attack_f1": float(2 * pos_share / (1 + pos_share)) if pos_share > 0 else 0.0,
+    }
 
 
 # ============================================================
@@ -2260,7 +2742,12 @@ def save_results(
     recall,
     f1,
     roc_auc,
-    pr_auc
+    pr_auc,
+    config,
+    test_row_index=None,
+    explanations=None,
+    scorer=None,
+    scorer_table=None
 ):
     """
     Save model, predictions and metadata.
@@ -2289,6 +2776,13 @@ def save_results(
         model_path
     )
 
+    if scorer is not None and scorer.lof is not None:
+
+        with open(os.path.join(output_path, "safe_scorer.pkl"), "wb") as file:
+
+            pickle.dump({"kind": scorer.kind, "n_neighbors": scorer.n_neighbors,
+                         "scaler": scorer.scaler, "lof": scorer.lof}, file)
+
     # --------------------------------------------------------
     # Predictions
     # --------------------------------------------------------
@@ -2299,6 +2793,10 @@ def save_results(
     )
 
     result_df = pd.DataFrame({
+
+        "test_row_index":
+            test_row_index if test_row_index is not None
+            else np.full(len(scores), -1),
 
         "anomaly_score":
             scores,
@@ -2319,6 +2817,10 @@ def save_results(
                 "Normal"
             )
     })
+
+    if explanations is not None:
+
+        result_df["top_features"] = explanations
 
     result_df.to_csv(
         predictions_path,
@@ -2356,16 +2858,45 @@ def save_results(
             selected_columns,
 
         "mask_ratio":
-            MASK_RATIO,
+            config["mask_ratio"],
 
         "epochs":
-            EPOCHS,
+            config["epochs"],
 
         "batch_size":
-            BATCH_SIZE,
+            config["batch_size"],
 
         "learning_rate":
-            LEARNING_RATE,
+            config["lr"],
+
+        "latent_dim":
+            config["latent"],
+
+        "dropout":
+            config["dropout"],
+
+        "loss":
+            config["loss"],
+
+        "hyperparameter_source":
+            config["source"],
+
+        "scorer":
+            scorer.name if scorer is not None else "recon",
+
+        "scorer_selection_validation_auc":
+            scorer_table or [],
+
+        "mask_ratio_selection_validation_auc":
+            config.get("mask_selection", []),
+
+        "flag_rate_per_class": {
+            str(int(v)): float(predictions[y_test == v].mean())
+            for v in np.unique(y_test)
+        },
+
+        "max_validation_fpr":
+            MAX_VALIDATION_FPR,
 
         "threshold":
             threshold,
@@ -2393,6 +2924,13 @@ def save_results(
 
         "pr_auc":
             float(pr_auc),
+
+        **imbalance_aware_metrics(
+            int(np.sum((predictions == 1) & (y_true_binary == 1))),
+            int(np.sum((predictions == 1) & (y_true_binary == 0))),
+            int(np.sum((predictions == 0) & (y_true_binary == 0))),
+            int(np.sum((predictions == 0) & (y_true_binary == 1)))
+        ),
 
         "model_file":
             "safe_model.pt",
@@ -2554,10 +3092,42 @@ def process_dataset(
         selected_features
     )
 
+    leaked = [c for c in selected_columns if c in LEAKY_COLUMNS]
+
+    if leaked:
+
+        print(
+            f"\nWARNING: dropping label-leaking column(s) "
+            f"from features: {leaked}"
+        )
+
+        selected_columns = [
+            c for c in selected_columns
+            if c not in LEAKY_COLUMNS
+        ]
+
     print(
         f"Matched features: "
         f"{len(selected_columns)}"
     )
+
+    # --------------------------------------------------------
+    # Hyperparameters (tuned per dataset if available)
+    # --------------------------------------------------------
+
+    config = load_safe_config(
+        dataset_name
+    )
+
+    print(
+        f"\nHyperparameters ({config['source']}):"
+    )
+
+    for key in ["epochs", "mask_ratio", "lr", "batch_size", "latent", "dropout", "loss", "scorer"]:
+
+        print(
+            f"  {key}: {config[key]}"
+        )
 
     # --------------------------------------------------------
     # Display selected features
@@ -2651,22 +3221,82 @@ def process_dataset(
     # Train SAFE
     # --------------------------------------------------------
 
-    model = train_safe_model(
-        X_normal_train,
-        X_normal_train.shape[1]
+    # One model per candidate mask ratio; each gets its scorer selected on
+    # validation, and the (mask ratio, scorer) pair with the best VALIDATION
+    # ROC-AUC is kept. A single mask ratio means no search.
+    mask_candidates = (
+        list(config["mask_ratio"])
+        if isinstance(config["mask_ratio"], (list, tuple))
+        else [config["mask_ratio"]]
     )
 
-    # --------------------------------------------------------
-    # Reconstruction errors on validation sets
-    # --------------------------------------------------------
+    best = None
+    mask_selection = []
+
+    for mask_ratio in mask_candidates:
+
+        torch.manual_seed(RANDOM_SEED)
+        np.random.seed(RANDOM_SEED)
+
+        candidate_config = {**config, "mask_ratio": mask_ratio}
+
+        if len(mask_candidates) > 1:
+
+            print(f"\n----- Candidate mask ratio {mask_ratio} -----")
+
+        model_i = train_safe_model(
+            X_normal_train,
+            X_normal_train.shape[1],
+            candidate_config
+        )
+
+        # --------------------------------------------------------
+        # Anomaly scorer (selected on validation data)
+        # --------------------------------------------------------
+
+        scorer_i, table_i = select_scorer(
+            model_i,
+            X_normal_train,
+            X_normal_val,
+            X_attack_val,
+            config.get("scorer", SCORER)
+        )
+
+        auc_i = next(
+            (r["val_roc_auc"] for r in table_i if r["scorer"] == scorer_i.name),
+            float("nan")
+        )
+
+        mask_selection.append(
+            {"mask_ratio": mask_ratio, "scorer": scorer_i.name, "val_roc_auc": auc_i}
+        )
+
+        if best is None or (
+            not np.isnan(auc_i) and auc_i > best[3] + SCORER_TOLERANCE
+        ):
+
+            best = (mask_ratio, model_i, (scorer_i, table_i), auc_i)
+
+    mask_ratio, model, (scorer, scorer_table), _ = best
+
+    config = {**config, "mask_ratio": mask_ratio, "mask_selection": mask_selection}
+
+    if len(mask_candidates) > 1:
+
+        print("\nMask ratio selection (validation ROC-AUC of the selected scorer):")
+
+        for r in mask_selection:
+
+            print(f"  mask {r['mask_ratio']:<4} {r['scorer']:<18} {r['val_roc_auc']}")
+
+        print(f"Selected mask ratio: {mask_ratio}  (scorer {scorer.name})")
 
     print(
         "\nCalculating validation "
-        "reconstruction errors..."
+        "anomaly scores..."
     )
 
-    normal_val_errors = reconstruction_errors(
-        model,
+    normal_val_errors = scorer.score(
         X_normal_val
     )
 
@@ -2678,8 +3308,7 @@ def process_dataset(
         X_attack_val
     ) > 0:
 
-        attack_val_errors = reconstruction_errors(
-            model,
+        attack_val_errors = scorer.score(
             X_attack_val
         )
 
@@ -2718,12 +3347,13 @@ def process_dataset(
     # Load test data (stratified)
     # --------------------------------------------------------
 
-    X_test, y_test = load_test_data(
+    X_test, y_test, test_row_index = load_test_data(
         test_path,
         selected_columns,
         label_column,
         normal_label,
-        MAX_TEST_SAMPLES
+        MAX_TEST_SAMPLES,
+        return_index=True
     )
 
     # Transform test features using the fitted RobustScaler
@@ -2745,11 +3375,22 @@ def process_dataset(
         roc_auc,
         pr_auc
     ) = evaluate_safe(
-        model,
+        scorer,
         X_test,
         y_test,
         normal_label,
         threshold
+    )
+
+    # --------------------------------------------------------
+    # Per-feature explanations (used as evidence by M4/M5)
+    # --------------------------------------------------------
+
+    explanations = explain_predictions(
+        model,
+        X_test,
+        X_normal_val,
+        selected_columns
     )
 
     # --------------------------------------------------------
@@ -2772,7 +3413,12 @@ def process_dataset(
         recall,
         f1,
         roc_auc,
-        pr_auc
+        pr_auc,
+        config,
+        test_row_index=test_row_index,
+        explanations=explanations,
+        scorer=scorer,
+        scorer_table=scorer_table
     )
 
     print(

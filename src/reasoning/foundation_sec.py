@@ -1,28 +1,42 @@
 """
 M5 - Foundation-Sec Reasoning Layer
 ====================================
-Integrates Foundation-Sec-8B-Instruct to convert anomalous IoMT flow evidence
-into structured cybersecurity threat analyses, MITRE ATT&CK technique attributions,
-and actionable SDN mitigation directives.
+Turns M4 threat evidence (real SAFE detections) into structured threat
+analyses: MITRE ATT&CK attribution, clinical impact and an SDN mitigation
+directive.
 
-Inputs:
-  - JSON Threat-Evidence object (results/reasoning/<dataset>/threat_evidence.json)
+Inputs
+  - results/reasoning/<dataset>/threat_evidence.json  (from M4)
 
-Outputs:
-  - Detailed threat reasoning (results/reasoning/<dataset>/foundation_sec_reasoning.json)
-  - MITRE ATT&CK technique summary (results/reasoning/<dataset>/mitre_attack_summary.json)
-  - SOC Executive Threat Report (results/reasoning/<dataset>/threat_report.md)
+Outputs
+  - results/reasoning/<dataset>/foundation_sec_reasoning.json
+  - results/reasoning/<dataset>/mitre_attack_summary.json  (incl. evaluation)
+  - results/reasoning/<dataset>/threat_report.md
 
-Backends Supported:
-  1. offline (default)   - Built-in deterministic IoMT cybersecurity expert reasoning engine.
-                           Runs immediately on CPU / 8GB RAM with zero external dependencies.
-  2. huggingface          - Local / GPU execution of cisco/Foundation-Sec-8B-Instruct via transformers.
-  3. api                  - Remote vLLM / Ollama / Hugging Face Inference API endpoint.
+Backends
+  1. offline (default)  RULE-BASED engine (not a language model). Benign vs
+                        attack follows the SAFE verdict; the attack type comes
+                        from simple evidence rules (port / protocol / flags).
+                        Flows that match no rule are reported as unclassified.
+  2. huggingface        Local Foundation-Sec-8B-Instruct via transformers
+                        (needs a GPU; ~16 GB in bf16, or set FOUNDATION_SEC_4BIT=1
+                        with bitsandbytes for ~6 GB).
+  3. api                Any OpenAI-compatible chat endpoint (Ollama, vLLM,
+                        LM Studio). Set FOUNDATION_SEC_API_URL, e.g.
+                        http://localhost:11434/v1/chat/completions, and
+                        --model-id to the served model name.
+
+The reasoning step NEVER sees the ground truth. Ground truth is attached to
+each analysis only afterwards, to compute evaluation metrics:
+  - attribution accuracy (technique level) on attacks SAFE flagged
+  - false-mitigation rate (benign flows given a blocking/limiting action)
+  - missed-attack rate (attack flows given ALLOW_FLOW)
 """
 
 import os
-import sys
+import re
 import json
+import time
 import argparse
 from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional
@@ -34,36 +48,66 @@ import numpy as np
 # PROJECT PATHS
 # ============================================================
 
-PROJECT_ROOT = os.path.abspath(
-    os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        ".."
-    )
-)
-
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 REASONING_RESULTS_DIR = os.path.join(PROJECT_ROOT, "results", "reasoning")
 
 
 # ============================================================
-# SYSTEM PROMPT FOR FOUNDATION-SEC-8B-INSTRUCT
+# PROMPT
 # ============================================================
 
-FOUNDATION_SEC_SYSTEM_PROMPT = """You are Foundation-Sec-8B, a specialized cybersecurity foundation language model developed for threat intelligence, MITRE ATT&CK attribution, and Internet of Medical Things (IoMT) defensive reasoning.
+FOUNDATION_SEC_SYSTEM_PROMPT = """You are a cybersecurity analyst model specialised in threat intelligence, MITRE ATT&CK attribution and Internet of Medical Things (IoMT) network defence.
 
-Your mission:
-Given network flow evidence flagged as anomalous by the self-supervised SAFE detector, you must:
-1. Interpret the anomalous telemetry and clinical context.
-2. Attribute the behavior to the precise MITRE ATT&CK Enterprise/ICS matrix tactic, technique, and sub-technique.
-3. Reference relevant CWEs or CVEs where applicable.
-4. Evaluate patient safety risks and clinical workflow impacts.
-5. Generate an actionable, SDN-enforceable mitigation directive (BLOCK_FLOW, RATE_LIMIT, QUARANTINE_HOST, or ISOLATE_PORT).
+You receive one network flow scored by the SAFE self-supervised anomaly detector, with the detector's verdict, its most anomalous features and the flow record. Some fields may be null when the dataset does not contain them.
 
-You MUST output your response strictly as valid JSON conforming to the requested schema. No surrounding commentary."""
+Tasks:
+1. Decide whether the evidence indicates malicious activity. Consider the detector verdict, but the detector can be wrong.
+2. If malicious, attribute it to the most specific MITRE ATT&CK tactic and technique the evidence supports. If it cannot be attributed, use technique_id "None".
+3. Assess the clinical / patient-safety impact.
+4. Recommend one SDN-enforceable action. Use ALLOW_FLOW for benign traffic.
+
+Answer with ONE valid JSON object that follows the schema exactly, and nothing else."""
+
+OUTPUT_SCHEMA = """{
+  "threat_summary": "<1-3 sentences>",
+  "threat_type": "<classification, or 'Benign' >",
+  "severity": "INFORMATIONAL | LOW | MEDIUM | HIGH | CRITICAL",
+  "confidence_score": <float 0.0-1.0>,
+  "mitre_attack": {
+    "tactic": "<tactic name or 'None (Benign)'>",
+    "tactic_id": "<TAxxxx or 'N/A'>",
+    "technique_id": "<Txxxx, Txxxx.xxx or 'None'>",
+    "technique_name": "<name>",
+    "sub_technique_id": "<Txxxx.xxx or null>",
+    "sub_technique_name": "<name or null>",
+    "description": "<why this technique>"
+  },
+  "cwe_cve_references": [{"id": "<CWE/CVE id>", "description": "<text>"}],
+  "clinical_impact_assessment": {
+    "patient_safety_risk": "NEGLIGIBLE | LOW | MODERATE | HIGH | CRITICAL",
+    "clinical_service_disruption": "<text>",
+    "data_integrity_loss": "<text>"
+  },
+  "mitigation_directive": {
+    "action": "ALLOW_FLOW | RATE_LIMIT | BLOCK_FLOW | QUARANTINE_HOST | ISOLATE_PORT",
+    "priority": <int 1-5>,
+    "sdn_action": "FORWARD | METER_POLICING | DROP | SET_VLAN_QUARANTINE | PORT_SECURITY_SHUTDOWN",
+    "parameters": {"rate_limit_pps": <int>, "hard_timeout_sec": <int>, "idle_timeout_sec": <int>, "vlan_quarantine": <bool>},
+    "technical_rationale": "<text>",
+    "clinical_rationale": "<text>"
+  }
+}"""
+
+ALLOWED_ACTIONS = {"ALLOW_FLOW", "RATE_LIMIT", "BLOCK_FLOW", "QUARANTINE_HOST", "ISOLATE_PORT"}
+ALLOWED_SEVERITY = {"INFORMATIONAL", "LOW", "MEDIUM", "HIGH", "CRITICAL"}
+TECHNIQUE_RE = re.compile(r"^T\d{4}(\.\d{3})?$")
+BENIGN_LABELS = {"normal", "benign"}
 
 
 # ============================================================
 # MITRE ATT&CK & IOMT CYBERSECURITY KNOWLEDGE BASE
+# (used by the rule-based engine and as ground-truth reference for
+#  scoring attribution: true attack label -> expected technique)
 # ============================================================
 
 IOMT_ATTACK_KNOWLEDGE_BASE = {
@@ -594,28 +638,148 @@ IOMT_ATTACK_KNOWLEDGE_BASE = {
             "technical_rationale": "Permit legitimate medical device flow to pass through OpenFlow switches unimpeded without filtering or rate limiting.",
             "clinical_rationale": "Maintains continuous, real-time patient physiological monitoring and uninterrupted medical device operation."
         }
+    },
+
+    # --------------------------------------------------------
+    # Generic entries used by the rule-based offline engine
+    # --------------------------------------------------------
+    "http_dos": {
+        "threat_summary": "Anomalous HTTP flow towards a clinical web service consistent with an application-layer denial-of-service pattern (e.g. slow headers/body, slow read or range-header amplification).",
+        "threat_type": "Application Layer Denial of Service (HTTP)",
+        "severity": "HIGH",
+        "confidence_score": 0.60,
+        "mitre_attack": {
+            "tactic": "Impact",
+            "tactic_id": "TA0040",
+            "technique_id": "T1499",
+            "technique_name": "Endpoint Denial of Service",
+            "sub_technique_id": None,
+            "sub_technique_name": None,
+            "description": "Flow to an HTTP service flagged by SAFE; port-based rule maps it to endpoint DoS at technique level."
+        },
+        "cwe_cve_references": [
+            {"id": "CWE-400", "description": "Uncontrolled Resource Consumption"}
+        ],
+        "clinical_impact_assessment": {
+            "patient_safety_risk": "HIGH",
+            "clinical_service_disruption": "Possible exhaustion of clinical web gateway resources.",
+            "data_integrity_loss": "Availability impact; no direct data corruption indicated."
+        },
+        "mitigation_directive": {
+            "action": "RATE_LIMIT",
+            "priority": 2,
+            "sdn_action": "METER_POLICING",
+            "parameters": {"rate_limit_pps": 50, "hard_timeout_sec": 1800, "idle_timeout_sec": 300, "vlan_quarantine": False},
+            "technical_rationale": "Rate-limit the source towards the HTTP service instead of a hard drop, because the attribution comes from a port rule.",
+            "clinical_rationale": "Limits resource exhaustion while keeping legitimate clinical web access possible."
+        }
+    },
+
+    "unclassified_anomaly": {
+        "threat_summary": "Flow flagged as anomalous by SAFE that matches no rule of the offline engine; attack type undetermined.",
+        "threat_type": "Unclassified Network Anomaly",
+        "severity": "MEDIUM",
+        "confidence_score": 0.40,
+        "mitre_attack": {
+            "tactic": "Unknown",
+            "tactic_id": "N/A",
+            "technique_id": "None",
+            "technique_name": "Unattributed anomaly",
+            "sub_technique_id": None,
+            "sub_technique_name": None,
+            "description": "No ATT&CK technique can be attributed from the available evidence by the rule-based engine."
+        },
+        "cwe_cve_references": [],
+        "clinical_impact_assessment": {
+            "patient_safety_risk": "MODERATE",
+            "clinical_service_disruption": "Unknown; analyst review required.",
+            "data_integrity_loss": "Unknown."
+        },
+        "mitigation_directive": {
+            "action": "RATE_LIMIT",
+            "priority": 3,
+            "sdn_action": "METER_POLICING",
+            "parameters": {"rate_limit_pps": 100, "hard_timeout_sec": 900, "idle_timeout_sec": 300, "vlan_quarantine": False},
+            "technical_rationale": "Conservative rate limit pending SOC analyst review.",
+            "clinical_rationale": "Avoids fully blocking a possibly legitimate clinical flow on uncertain evidence."
+        }
     }
 }
 
 
 # ============================================================
-# FOUNDATION-SEC REASONER CLASS
+# EVALUATION HELPERS
+# ============================================================
+
+def _technique_root(tid: Optional[str]) -> Optional[str]:
+    if not tid or str(tid) in ("None", "N/A", "null"):
+        return None
+    return str(tid).split(".")[0]
+
+
+def expected_technique(label: Optional[str]) -> Optional[str]:
+    """Ground-truth attack label -> expected technique (from the knowledge base)."""
+    if label is None:
+        return None
+    entry = IOMT_ATTACK_KNOWLEDGE_BASE.get(label) or IOMT_ATTACK_KNOWLEDGE_BASE.get(str(label).lower())
+    if not entry:
+        return None
+    return _technique_root(entry["mitre_attack"]["technique_id"])
+
+
+def compute_reasoning_metrics(analyses: List[Dict[str, Any]]) -> Dict[str, Any]:
+    gts = [a.get("ground_truth") or {} for a in analyses]
+    actions = [a.get("mitigation_directive", {}).get("action") for a in analyses]
+
+    benign = [i for i, g in enumerate(gts) if g.get("is_attack") is False]
+    attacks = [i for i, g in enumerate(gts) if g.get("is_attack") is True]
+    flagged_attacks = [i for i in attacks if analyses[i].get("safe_verdict") == "Anomaly"]
+
+    scored = [i for i in flagged_attacks if expected_technique(gts[i].get("label"))]
+    correct = sum(
+        1 for i in scored
+        if _technique_root(analyses[i].get("mitre_attack", {}).get("technique_id"))
+        == expected_technique(gts[i].get("label")))
+
+    benign_restricted = sum(1 for i in benign if actions[i] != "ALLOW_FLOW")
+    attacks_allowed = sum(1 for i in attacks if actions[i] == "ALLOW_FLOW")
+    attacks_actioned = len(attacks) - attacks_allowed
+
+    meta = [a.get("reasoning_metadata", {}) for a in analyses]
+    llm_runs = [m for m in meta if m.get("llm_output_valid") is not None]
+    latencies = [m.get("latency_ms") for m in meta if m.get("latency_ms") is not None]
+
+    def pct(n, d):
+        return round(100.0 * n / d, 2) if d else None
+
+    return {
+        "flows_analysed": len(analyses),
+        "ground_truth_attacks": len(attacks),
+        "ground_truth_benign": len(benign),
+        "attacks_flagged_by_safe": len(flagged_attacks),
+        "attribution_scored_flows": len(scored),
+        "attribution_accuracy_percent": pct(correct, len(scored)),
+        "attack_mitigation_coverage_percent": pct(attacks_actioned, len(attacks)),
+        "missed_attack_rate_percent": pct(attacks_allowed, len(attacks)),
+        "false_mitigation_rate_percent": pct(benign_restricted, len(benign)),
+        "benign_flows_restricted": benign_restricted,
+        "llm_valid_output_percent": pct(sum(1 for m in llm_runs if m.get("llm_output_valid")), len(llm_runs)),
+        "fallback_used_count": sum(1 for m in meta if m.get("fallback_used")),
+        "mean_reasoning_latency_ms": round(float(np.mean(latencies)), 3) if latencies else None,
+        "notes": "Attribution accuracy is technique-level (sub-techniques ignored) on ground-truth attacks "
+                 "that SAFE flagged and whose label has a technique in the knowledge base.",
+    }
+
+
+# ============================================================
+# FOUNDATION-SEC REASONER
 # ============================================================
 
 class FoundationSecReasoner:
-    """
-    Reasoning layer consuming M4 threat evidence and producing
-    MITRE ATT&CK attribution and SDN mitigation directives.
-    """
 
-    def __init__(
-        self,
-        dataset_name: str,
-        backend: str = "offline",
-        model_id: str = "cisco/Foundation-Sec-8B-Instruct",
-        api_url: Optional[str] = None,
-        api_key: Optional[str] = None
-    ):
+    def __init__(self, dataset_name: str, backend: str = "offline",
+                 model_id: str = "fdtn-ai/Foundation-Sec-8B-Instruct",
+                 api_url: Optional[str] = None, api_key: Optional[str] = None):
         self.dataset_name = dataset_name
         self.backend = backend.lower()
         self.model_id = model_id
@@ -624,430 +788,321 @@ class FoundationSecReasoner:
         self.results_dir = os.path.join(REASONING_RESULTS_DIR, dataset_name)
         os.makedirs(self.results_dir, exist_ok=True)
 
-        self._hf_pipeline = None
+        self._tokenizer = None
+        self._model = None
         if self.backend == "huggingface":
             self._init_huggingface()
-
-    def _init_huggingface(self):
-        """Optionally initialize local HuggingFace transformers pipeline if available."""
-        try:
-            import torch
-            from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
-
-            print(f"[M5] Initializing HuggingFace model: {self.model_id}...")
-            tokenizer = AutoTokenizer.from_pretrained(self.model_id)
-            model = AutoModelForCausalLM.from_pretrained(
-                self.model_id,
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                device_map="auto" if torch.cuda.is_available() else "cpu"
-            )
-            self._hf_pipeline = pipeline(
-                "text-generation",
-                model=model,
-                tokenizer=tokenizer,
-                max_new_tokens=512,
-                temperature=0.1
-            )
-            print("[M5] HuggingFace model loaded successfully.")
-        except Exception as e:
-            print(f"[M5] Warning: Failed to load HuggingFace pipeline ({e}). Falling back to 'offline' reasoning engine.")
+        if self.backend == "api" and not self.api_url:
+            print("[M5] WARNING: backend 'api' but FOUNDATION_SEC_API_URL is not set; using rule-based engine.")
             self.backend = "offline"
 
-    def format_prompt(self, evidence_item: Dict[str, Any]) -> str:
-        """
-        Builds the prompt following the Foundation-Sec-8B-Instruct contract.
-        """
-        evidence_str = json.dumps(evidence_item, indent=2)
-        prompt = f"""<|system|>
-{FOUNDATION_SEC_SYSTEM_PROMPT}
-<|user|>
-Analyze the following IoMT network threat evidence detected by the SAFE self-supervised detector:
+    # --------------------------------------------------------
+    # Backends
+    # --------------------------------------------------------
 
-```json
-{evidence_str}
-```
+    def _init_huggingface(self):
+        try:
+            import torch
+            from transformers import AutoTokenizer, AutoModelForCausalLM
+            kwargs = {}
+            if torch.cuda.is_available():
+                kwargs["device_map"] = "auto"
+                if os.environ.get("FOUNDATION_SEC_4BIT") == "1":
+                    from transformers import BitsAndBytesConfig
+                    kwargs["quantization_config"] = BitsAndBytesConfig(
+                        load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
+                else:
+                    kwargs["torch_dtype"] = torch.bfloat16
+            else:
+                print("[M5] WARNING: no GPU found. An 8B model on CPU needs ~32 GB RAM and is very slow.")
+                kwargs["torch_dtype"] = torch.float32
+            print(f"[M5] Loading {self.model_id} ...")
+            self._tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+            self._model = AutoModelForCausalLM.from_pretrained(self.model_id, **kwargs)
+            self._model.eval()
+            print("[M5] Model loaded.")
+        except Exception as e:
+            print(f"[M5] WARNING: could not load the model ({e}). Using the rule-based engine.")
+            self.backend = "offline"
 
-Produce a structured JSON threat analysis strictly adhering to this schema:
-{{
-  "evidence_id": "{evidence_item.get('evidence_id')}",
-  "threat_summary": "<Detailed threat summary>",
-  "threat_type": "<Threat classification>",
-  "severity": "LOW | MEDIUM | HIGH | CRITICAL",
-  "confidence_score": <float between 0.0 and 1.0>,
-  "mitre_attack": {{
-    "tactic": "<MITRE Tactic Name>",
-    "tactic_id": "<TAxxxx>",
-    "technique_id": "<Txxxx>",
-    "technique_name": "<Technique Name>",
-    "sub_technique_id": "<Txxxx.xxx or null>",
-    "sub_technique_name": "<Sub-technique Name or null>",
-    "description": "<Technical attribution description>"
-  }},
-  "cwe_cve_references": [
-    {{"id": "<CVE or CWE ID>", "description": "<Description>"}}
-  ],
-  "clinical_impact_assessment": {{
-    "patient_safety_risk": "NEGLIGIBLE | LOW | MODERATE | SEVERE | CRITICAL",
-    "clinical_service_disruption": "<Assessment of clinical workflow disruption>",
-    "data_integrity_loss": "<Assessment of patient data integrity or privacy loss>"
-  }},
-  "mitigation_directive": {{
-    "action": "BLOCK_FLOW | RATE_LIMIT | QUARANTINE_HOST | ISOLATE_PORT",
-    "priority": <int 1-5>,
-    "sdn_action": "DROP | METER_POLICING | SET_VLAN_QUARANTINE | PORT_SECURITY_SHUTDOWN",
-    "parameters": {{
-      "rate_limit_pps": <int>,
-      "hard_timeout_sec": <int>,
-      "idle_timeout_sec": <int>,
-      "vlan_quarantine": <bool>
-    }},
-    "technical_rationale": "<SDN controller OpenFlow rule reasoning>",
-    "clinical_rationale": "<Clinical patient care justification>"
-  }}
-}}
-<|assistant|>
-"""
-        return prompt
+    @staticmethod
+    def sanitize_evidence(item: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove everything that reveals the answer before it reaches a model."""
+        clean = {k: v for k, v in item.items() if k not in ("ground_truth", "is_attack", "raw_traffic_label")}
+        return clean
 
-    def _offline_reason(self, evidence_item: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Deterministic, domain-specialized IoMT reasoning engine embodying
-        Foundation-Sec-8B knowledge base for IoMT attacks and nominal flows.
-        """
-        is_attack = evidence_item.get("is_attack", True)
-        attack_label = evidence_item.get("raw_traffic_label", "apachekiller")
-        if not is_attack:
-            attack_label = "normal" if self.dataset_name == "IoMT-TrafficData" else "Benign"
+    def build_messages(self, item: Dict[str, Any]) -> List[Dict[str, str]]:
+        evidence = json.dumps(self.sanitize_evidence(item), indent=2, default=str)
+        user = ("Analyse this IoMT network flow evidence:\n\n```json\n" + evidence + "\n```\n\n"
+                "Respond with one JSON object following this schema:\n" + OUTPUT_SCHEMA)
+        return [{"role": "system", "content": FOUNDATION_SEC_SYSTEM_PROMPT},
+                {"role": "user", "content": user}]
 
-        knowledge = IOMT_ATTACK_KNOWLEDGE_BASE.get(attack_label)
+    def _generate_hf(self, messages: List[Dict[str, str]]) -> str:
+        import torch
+        inputs = self._tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt")
+        inputs = inputs.to(self._model.device)
+        with torch.no_grad():
+            out = self._model.generate(inputs, max_new_tokens=700, do_sample=False,
+                                       pad_token_id=self._tokenizer.eos_token_id)
+        return self._tokenizer.decode(out[0][inputs.shape[1]:], skip_special_tokens=True)
 
-        if not knowledge:
-            # Fallback for unexpected label
-            knowledge = IOMT_ATTACK_KNOWLEDGE_BASE["normal"] if not is_attack else IOMT_ATTACK_KNOWLEDGE_BASE["apachekiller"]
-
-        flow = evidence_item.get("network_flow", {})
-        device_ctx = evidence_item.get("device_context", {})
-        det_metrics = evidence_item.get("detection_metrics", {})
-
-        # Build personalized analysis tied to flow targets
-        mitigation = knowledge["mitigation_directive"].copy()
-        mitigation["target"] = {
-            "source_ip": flow.get("source_ip", "10.0.100.5"),
-            "destination_ip": flow.get("destination_ip", "192.168.20.50"),
-            "source_port": flow.get("source_port", 48158),
-            "destination_port": flow.get("destination_port", 80),
-            "protocol": flow.get("protocol", "TCP")
-        }
-
-        # Tailor confidence to SAFE reconstruction error
-        if is_attack:
-            conf = min(0.99, max(0.85, float(det_metrics.get("confidence", 0.90))))
-        else:
-            conf = float(det_metrics.get("confidence", 0.98))
-
-        result = {
-            "evidence_id": evidence_item.get("evidence_id"),
-            "flow_id": evidence_item.get("flow_id"),
-            "dataset": self.dataset_name,
-            "is_attack": is_attack,
-            "verdict": det_metrics.get("verdict", "Anomaly" if is_attack else "Normal"),
-            "threat_summary": knowledge["threat_summary"],
-            "threat_type": knowledge["threat_type"],
-            "severity": knowledge["severity"],
-            "confidence_score": round(conf, 4),
-            "mitre_attack": knowledge["mitre_attack"],
-            "cwe_cve_references": knowledge["cwe_cve_references"],
-            "clinical_impact_assessment": knowledge["clinical_impact_assessment"],
-            "mitigation_directive": mitigation,
-            "reasoning_metadata": {
-                "engine": "Foundation-Sec-8B-Offline-Expert",
-                "evidence_timestamp": evidence_item.get("timestamp"),
-                "reasoned_at": datetime.now(timezone.utc).isoformat(),
-                "anomaly_score": det_metrics.get("anomaly_score"),
-                "device_role": device_ctx.get("role")
-            }
-        }
-        return result
-
-    def _api_reason(self, prompt: str, evidence_item: Dict[str, Any]) -> Dict[str, Any]:
-        """Remote endpoint inference."""
+    def _generate_api(self, messages: List[Dict[str, str]]) -> str:
         import urllib.request
-
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-
-        payload = json.dumps({
-            "prompt": prompt,
-            "max_tokens": 512,
-            "temperature": 0.1
-        }).encode("utf-8")
-
+        payload = json.dumps({"model": self.model_id, "messages": messages,
+                              "temperature": 0, "max_tokens": 700}).encode("utf-8")
         req = urllib.request.Request(self.api_url, data=payload, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                text = data.get("response", data.get("text", ""))
-                # Parse JSON block
-                start = text.find("{")
-                end = text.rfind("}") + 1
-                if start != -1 and end != 0:
-                    return json.loads(text[start:end])
-        except Exception as e:
-            print(f"[M5] API inference failed ({e}), falling back to offline engine.")
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data["choices"][0]["message"]["content"]
 
-        return self._offline_reason(evidence_item)
+    # --------------------------------------------------------
+    # Output validation
+    # --------------------------------------------------------
+
+    @staticmethod
+    def parse_and_validate(text: str) -> Optional[Dict[str, Any]]:
+        start, end = text.find("{"), text.rfind("}")
+        if start == -1 or end <= start:
+            return None
+        try:
+            obj = json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            return None
+        try:
+            mit = obj["mitigation_directive"]
+            att = obj["mitre_attack"]
+            mit["action"] = str(mit["action"]).upper()
+            obj["severity"] = str(obj["severity"]).upper()
+            if mit["action"] not in ALLOWED_ACTIONS or obj["severity"] not in ALLOWED_SEVERITY:
+                return None
+            tid = str(att.get("technique_id", "None"))
+            if tid not in ("None", "N/A") and not TECHNIQUE_RE.match(tid):
+                return None
+            obj["confidence_score"] = float(min(1.0, max(0.0, float(obj.get("confidence_score", 0.5)))))
+            obj.setdefault("cwe_cve_references", [])
+            obj.setdefault("clinical_impact_assessment", {})
+            obj.setdefault("threat_summary", "")
+            obj.setdefault("threat_type", "")
+            return obj
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    # --------------------------------------------------------
+    # Rule-based engine (offline)
+    # --------------------------------------------------------
+
+    def rule_based_key(self, item: Dict[str, Any]) -> str:
+        if item.get("detection", {}).get("verdict") != "Anomaly":
+            return "normal"
+        flow = item.get("network_flow", {}) or {}
+        port = flow.get("destination_port")
+        proto = str(flow.get("protocol") or "").upper()
+        syn, ack = flow.get("syn_flags"), flow.get("ack_flags")
+        bwd = flow.get("bwd_packets")
+        if port in (1883, 8883):
+            return "mqttmalaria"
+        if proto == "ARP":
+            return "arpspoofing"
+        if syn and not ack and (bwd is not None and bwd <= 1):
+            return "netscan"
+        if port in (80, 8080, 443):
+            return "http_dos"
+        return "unclassified_anomaly"
+
+    def _rule_based(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        k = IOMT_ATTACK_KNOWLEDGE_BASE[self.rule_based_key(item)]
+        return {key: json.loads(json.dumps(k[key])) for key in
+                ["threat_summary", "threat_type", "severity", "confidence_score", "mitre_attack",
+                 "cwe_cve_references", "clinical_impact_assessment", "mitigation_directive"]}
+
+    # --------------------------------------------------------
+    # One evidence item
+    # --------------------------------------------------------
+
+    def analyse_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        t0 = time.perf_counter()
+        llm_valid, fallback, raw_output = None, False, None
+        engine = "rule-based (offline)"
+
+        if self.backend in ("huggingface", "api"):
+            engine = f"{self.model_id} ({self.backend})"
+            try:
+                messages = self.build_messages(item)
+                raw_output = self._generate_hf(messages) if self.backend == "huggingface" else self._generate_api(messages)
+                analysis = self.parse_and_validate(raw_output)
+            except Exception as e:
+                print(f"[M5] model call failed for {item.get('evidence_id')}: {e}")
+                analysis = None
+            llm_valid = analysis is not None
+            if analysis is None:
+                fallback = True
+                analysis = self._rule_based(item)
+        else:
+            analysis = self._rule_based(item)
+
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        flow = item.get("network_flow", {}) or {}
+        det = item.get("detection", {}) or {}
+        analysis["mitigation_directive"]["target"] = {
+            "source_ip": flow.get("source_ip"),
+            "destination_ip": flow.get("destination_ip"),
+            "source_port": flow.get("source_port"),
+            "destination_port": flow.get("destination_port"),
+            "protocol": flow.get("protocol"),
+        }
+        return {
+            "evidence_id": item.get("evidence_id"),
+            "flow_id": item.get("flow_id"),
+            "dataset": self.dataset_name,
+            "safe_verdict": det.get("verdict"),
+            # kept for compatibility: True = flagged by SAFE (prediction, NOT ground truth)
+            "is_attack": det.get("verdict") == "Anomaly",
+            **analysis,
+            "reasoning_metadata": {
+                "engine": engine,
+                "backend": self.backend,
+                "llm_output_valid": llm_valid,
+                "fallback_used": fallback,
+                "latency_ms": round(latency_ms, 3),
+                "anomaly_score": det.get("anomaly_score"),
+                "device_role_assumed": (item.get("device_context") or {}).get("role"),
+                "reasoned_at": datetime.now(timezone.utc).isoformat(),
+                "raw_model_output": raw_output if (raw_output and not llm_valid) else None,
+            },
+            # attached AFTER reasoning, for evaluation only
+            "ground_truth": item.get("ground_truth"),
+        }
 
     def analyze_evidence(self, evidence_file: str) -> List[Dict[str, Any]]:
-        """
-        Consumes threat_evidence.json, performs threat analysis for each evidence item,
-        and returns the structured analyses.
-        """
         if not os.path.exists(evidence_file):
             raise FileNotFoundError(f"Evidence file not found: {evidence_file}")
-
         with open(evidence_file, "r", encoding="utf-8") as f:
-            evidence_payload = json.load(f)
+            items = json.load(f).get("evidence_items", [])
+        print(f"\n[M5] Reasoning over {len(items)} evidence items (backend: {self.backend})...")
+        analyses = []
+        for i, item in enumerate(items):
+            a = self.analyse_item(item)
+            analyses.append(a)
+            gt = (a.get("ground_truth") or {}).get("label", "?")
+            print(f"  [{i + 1:03d}/{len(items):03d}] {a['evidence_id']} SAFE={a['safe_verdict']:<7} "
+                  f"truth={str(gt):<16} -> {a['mitre_attack'].get('technique_id', 'None'):<9} "
+                  f"{a['severity']:<13} {a['mitigation_directive']['action']}")
+        return analyses
 
-        evidence_items = evidence_payload.get("evidence_items", [])
-        print(f"\n[M5] Reasoning over {len(evidence_items)} threat evidence items using backend '{self.backend}'...")
-
-        analyzed_items = []
-        for i, item in enumerate(evidence_items):
-            ev_id = item.get("evidence_id")
-            label = item.get("raw_traffic_label", "Unknown")
-
-            if self.backend == "offline":
-                analysis = self._offline_reason(item)
-            elif self.backend == "huggingface" and self._hf_pipeline:
-                prompt = self.format_prompt(item)
-                out = self._hf_pipeline(prompt)[0]["generated_text"]
-                # Parse output JSON
-                start = out.find("{", len(prompt) - 50)
-                end = out.rfind("}") + 1
-                try:
-                    analysis = json.loads(out[start:end])
-                except Exception:
-                    analysis = self._offline_reason(item)
-            elif self.backend == "api" and self.api_url:
-                prompt = self.format_prompt(item)
-                analysis = self._api_reason(prompt, item)
-            else:
-                analysis = self._offline_reason(item)
-
-            analyzed_items.append(analysis)
-            tactic = analysis.get("mitre_attack", {}).get("tactic", "Unknown")
-            tech_id = analysis.get("mitre_attack", {}).get("technique_id", "Txxxx")
-            sev = analysis.get("severity", "HIGH")
-            action = analysis.get("mitigation_directive", {}).get("action", "BLOCK_FLOW")
-
-            is_atk = analysis.get("is_attack", True)
-            class_tag = "ATTACK" if is_atk else "NORMAL"
-            print(f"  [{i+1:02d}/{len(evidence_items):02d}] {ev_id} [{class_tag:<6}] ({label:<13}) -> ATT&CK: {tech_id:<5} ({tactic:<22}) | Sev: {sev:<13} | Action: {action}")
-
-        return analyzed_items
+    # --------------------------------------------------------
+    # Save
+    # --------------------------------------------------------
 
     def save_results(self, analyses: List[Dict[str, Any]]) -> Dict[str, str]:
-        """
-        Saves all outputs:
-          - foundation_sec_reasoning.json
-          - mitre_attack_summary.json
-          - threat_report.md
-        """
-        # 1. Detailed reasoning JSON
         reasoning_path = os.path.join(self.results_dir, "foundation_sec_reasoning.json")
-        payload = {
-            "reasoning_metadata": {
+        with open(reasoning_path, "w", encoding="utf-8") as f:
+            json.dump({"reasoning_metadata": {
                 "generated_at": datetime.now(timezone.utc).isoformat(),
                 "dataset": self.dataset_name,
-                "model_identifier": self.model_id,
+                "model_identifier": self.model_id if self.backend != "offline" else None,
                 "reasoning_backend": self.backend,
-                "total_analyzed_threats": len(analyses)
-            },
-            "analyses": analyses
-        }
-        with open(reasoning_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=4)
+                "engine": "rule-based (offline)" if self.backend == "offline" else self.model_id,
+                "total_analyzed": len(analyses)},
+                "analyses": analyses}, f, indent=4, default=str)
 
-        # 2. MITRE ATT&CK Summary Aggregation
-        tactic_counts = {}
-        technique_counts = {}
-        severity_counts = {}
-        action_counts = {}
-
+        tactic_counts, technique_counts, severity_counts, action_counts = {}, {}, {}, {}
         for item in analyses:
             att = item.get("mitre_attack", {})
-            tactic = att.get("tactic", "Unknown")
-            tech = f"{att.get('technique_id', 'T0000')} - {att.get('technique_name', 'Unknown')}"
-            sev = item.get("severity", "MEDIUM")
-            act = item.get("mitigation_directive", {}).get("action", "BLOCK_FLOW")
-
-            tactic_counts[tactic] = tactic_counts.get(tactic, 0) + 1
-            technique_counts[tech] = technique_counts.get(tech, 0) + 1
-            severity_counts[sev] = severity_counts.get(sev, 0) + 1
-            action_counts[act] = action_counts.get(act, 0) + 1
+            tech = f"{att.get('technique_id', 'None')} - {att.get('technique_name', 'Unknown')}"
+            for d, key in ((tactic_counts, att.get("tactic", "Unknown")), (technique_counts, tech),
+                           (severity_counts, item.get("severity", "MEDIUM")),
+                           (action_counts, item.get("mitigation_directive", {}).get("action", "UNKNOWN"))):
+                d[key] = d.get(key, 0) + 1
 
         summary = {
             "dataset": self.dataset_name,
             "generated_at": datetime.now(timezone.utc).isoformat(),
+            "reasoning_backend": self.backend,
             "total_incidents": len(analyses),
             "severity_distribution": severity_counts,
             "mitre_tactics_distribution": tactic_counts,
             "mitre_techniques_distribution": technique_counts,
-            "sdn_mitigation_actions": action_counts
+            "sdn_mitigation_actions": action_counts,
+            "evaluation": compute_reasoning_metrics(analyses),
         }
-
         summary_path = os.path.join(self.results_dir, "mitre_attack_summary.json")
         with open(summary_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=4)
 
-        # 3. SOC Executive Threat Report (Markdown)
         report_path = os.path.join(self.results_dir, "threat_report.md")
         self._generate_markdown_report(report_path, summary, analyses)
+        print(f"\n[M5] Saved:\n  {reasoning_path}\n  {summary_path}\n  {report_path}")
+        return {"reasoning": reasoning_path, "summary": summary_path, "report": report_path}
 
-        print(f"\n[M5] Artefacts saved successfully:")
-        print(f"  Reasoning Analysis: {reasoning_path}")
-        print(f"  ATT&CK Summary:     {summary_path}")
-        print(f"  Executive Report:   {report_path}")
-
-        return {
-            "reasoning": reasoning_path,
-            "summary": summary_path,
-            "report": report_path
-        }
-
-    def _generate_markdown_report(
-        self,
-        report_path: str,
-        summary: Dict[str, Any],
-        analyses: List[Dict[str, Any]]
-    ):
-        """Generates a professional SOC analyst markdown report."""
-        lines = []
-        lines.append(f"# IoMT Security Operations Center (SOC) Threat Intelligence Report")
-        lines.append(f"**Dataset:** `{self.dataset_name}`  ")
-        lines.append(f"**Analysis Engine:** `Foundation-Sec-8B-Instruct` ({self.backend.upper()})  ")
-        lines.append(f"**Generated:** `{summary['generated_at']}`  ")
-        lines.append(f"**Total Incidents Analyzed:** `{summary['total_incidents']}`\n")
-
-        lines.append("## 1. Executive Summary")
-        lines.append("The AI-driven cybersecurity SOC detection pipeline ingested IoMT traffic, optimized features via the Whale Optimization Algorithm (WOA), and flagged anomalous behavior using the self-supervised SAFE Masked Autoencoder. Foundation-Sec-8B-Instruct reasoned over the resulting threat evidence, attributed the activity across the MITRE ATT&CK framework, and generated automated SDN mitigation actions.\n")
-
-        lines.append("### Severity Breakdown")
-        lines.append("| Severity | Incident Count | Percentage |")
-        lines.append("| :--- | :--- | :--- |")
-        total = max(1, summary["total_incidents"])
-        for sev, cnt in summary["severity_distribution"].items():
-            pct = (cnt / total) * 100
-            lines.append(f"| **{sev}** | {cnt} | {pct:.1f}% |")
-        lines.append("")
-
-        lines.append("### Automated SDN Mitigation Actions")
-        lines.append("| Recommended Action | Count | Enforcement Strategy |")
-        lines.append("| :--- | :--- | :--- |")
-        for act, cnt in summary["sdn_mitigation_actions"].items():
-            if act == "BLOCK_FLOW":
-                strategy = "OpenFlow DROP rule"
-            elif act == "RATE_LIMIT":
-                strategy = "Meter rate-limiting"
-            elif act == "QUARANTINE_HOST":
-                strategy = "Remediation VLAN quarantine"
-            elif act == "ISOLATE_PORT":
-                strategy = "Port security shutdown"
-            elif act == "ALLOW_FLOW":
-                strategy = "OpenFlow FORWARD (Unimpeded clinical flow)"
-            else:
-                strategy = "Policy evaluation"
-            lines.append(f"| `{act}` | {cnt} | {strategy} |")
-        lines.append("")
-
-        lines.append("## 2. MITRE ATT&CK Matrix Mapping")
-        lines.append("| Technique ID | Technique Name | Tactic | Incident Count |")
-        lines.append("| :--- | :--- | :--- | :--- |")
-        for tech, cnt in summary["mitre_techniques_distribution"].items():
-            parts = tech.split(" - ", 1)
-            t_id = parts[0]
-            t_name = parts[1] if len(parts) > 1 else ""
-            lines.append(f"| **{t_id}** | {t_name} | Enterprise / ICS | {cnt} |")
-        lines.append("")
-
-        lines.append("## 3. Detailed Incident Analyses (Sample)")
-        for item in analyses[:5]:
-            ev_id = item.get("evidence_id")
-            att = item.get("mitre_attack", {})
-            mit = item.get("mitigation_directive", {})
-            target = mit.get("target", {})
-            lines.append(f"### Incident {ev_id}: {item.get('threat_type')}")
-            lines.append(f"- **Severity:** `{item.get('severity')}` (Confidence: {item.get('confidence_score') * 100:.1f}%)")
-            lines.append(f"- **Target Flow:** `{target.get('source_ip')}:{target.get('source_port')} -> {target.get('destination_ip')}:{target.get('destination_port')}` ({target.get('protocol')})")
-            lines.append(f"- **ATT&CK Attribution:** `{att.get('technique_id')}` - *{att.get('technique_name')}* (Tactic: `{att.get('tactic')}`)")
-            lines.append(f"- **Threat Summary:** {item.get('threat_summary')}")
-            lines.append(f"- **Clinical Impact:** {item.get('clinical_impact_assessment', {}).get('clinical_service_disruption')}")
-            lines.append(f"- **Recommended SDN Action:** `{mit.get('action')}` - *{mit.get('technical_rationale')}*")
-            lines.append("")
-
+    def _generate_markdown_report(self, report_path, summary, analyses):
+        ev = summary["evaluation"]
+        engine = "Rule-based offline engine (not a language model)" if self.backend == "offline" \
+            else f"{self.model_id} via {self.backend}"
+        fmt = lambda v: "N/A" if v is None else f"{v}%"
+        lines = [
+            "# IoMT SOC Threat Intelligence Report",
+            f"**Dataset:** `{self.dataset_name}`  ",
+            f"**Reasoning engine:** {engine}  ",
+            f"**Generated:** `{summary['generated_at']}`  ",
+            f"**Flows analysed:** {summary['total_incidents']} (sampled from SAFE test predictions)", "",
+            "## 1. Evaluation against ground truth", "",
+            "| Metric | Value |", "| :--- | :--- |",
+            f"| Attribution accuracy (technique level, {ev['attribution_scored_flows']} flagged attacks) | {fmt(ev['attribution_accuracy_percent'])} |",
+            f"| Attack mitigation coverage | {fmt(ev['attack_mitigation_coverage_percent'])} |",
+            f"| Missed-attack rate (attack given ALLOW_FLOW) | {fmt(ev['missed_attack_rate_percent'])} |",
+            f"| False-mitigation rate (benign given restrictive action) | {fmt(ev['false_mitigation_rate_percent'])} |",
+            f"| Valid model output | {fmt(ev['llm_valid_output_percent'])} |",
+            f"| Mean reasoning latency | {ev['mean_reasoning_latency_ms']} ms |", "",
+            "## 2. Severity breakdown", "", "| Severity | Count |", "| :--- | :--- |",
+        ]
+        lines += [f"| {k} | {v} |" for k, v in summary["severity_distribution"].items()]
+        lines += ["", "## 3. Recommended SDN actions", "", "| Action | Count |", "| :--- | :--- |"]
+        lines += [f"| `{k}` | {v} |" for k, v in summary["sdn_mitigation_actions"].items()]
+        lines += ["", "## 4. MITRE ATT&CK techniques", "", "| Technique | Count |", "| :--- | :--- |"]
+        lines += [f"| {k} | {v} |" for k, v in summary["mitre_techniques_distribution"].items()]
+        lines += ["", "## 5. Sample incidents", ""]
+        for item in [a for a in analyses if a.get("safe_verdict") == "Anomaly"][:5]:
+            att, mit = item.get("mitre_attack", {}), item.get("mitigation_directive", {})
+            t = mit.get("target", {})
+            lines += [
+                f"### {item['evidence_id']}: {item.get('threat_type')}",
+                f"- **Ground truth:** {(item.get('ground_truth') or {}).get('label')}",
+                f"- **Flow:** `{t.get('source_ip')}:{t.get('source_port')} -> {t.get('destination_ip')}:{t.get('destination_port')}` ({t.get('protocol')})",
+                f"- **ATT&CK:** `{att.get('technique_id')}` {att.get('technique_name')} (tactic: {att.get('tactic')})",
+                f"- **Severity:** {item.get('severity')} (confidence {item.get('confidence_score')})",
+                f"- **Action:** `{mit.get('action')}` - {mit.get('technical_rationale')}", ""]
         with open(report_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
 
 
 # ============================================================
-# MAIN ENTRY POINT
+# MAIN
 # ============================================================
 
-def process_dataset_reasoning(
-    dataset_name: str,
-    backend: str = "offline",
-    model_id: str = "cisco/Foundation-Sec-8B-Instruct"
-):
-    print("\n" + "=" * 65)
-    print(f"M5 - Foundation-Sec Reasoning: {dataset_name}")
-    print("=" * 65)
-
-    evidence_file = os.path.join(
-        REASONING_RESULTS_DIR, dataset_name, "threat_evidence.json"
-    )
-
+def process_dataset_reasoning(dataset_name: str, backend: str = "offline",
+                              model_id: str = "fdtn-ai/Foundation-Sec-8B-Instruct", max_samples: int = 100):
+    evidence_file = os.path.join(REASONING_RESULTS_DIR, dataset_name, "threat_evidence.json")
     if not os.path.exists(evidence_file):
-        print(f"[M5] Evidence file not found. Running M4 Evidence Builder first...")
         from .threat_evidence import ThreatEvidenceBuilder
-        builder = ThreatEvidenceBuilder(dataset_name)
-        evidence_file = builder.build_and_save_evidence(max_samples=25)
-
-    reasoner = FoundationSecReasoner(
-        dataset_name=dataset_name,
-        backend=backend,
-        model_id=model_id
-    )
-
-    analyses = reasoner.analyze_evidence(evidence_file)
-    saved_paths = reasoner.save_results(analyses)
-    return saved_paths
+        evidence_file = ThreatEvidenceBuilder(dataset_name).build_and_save_evidence(max_samples=max_samples)
+    reasoner = FoundationSecReasoner(dataset_name=dataset_name, backend=backend, model_id=model_id)
+    return reasoner.save_results(reasoner.analyze_evidence(evidence_file))
 
 
 def main():
     parser = argparse.ArgumentParser(description="M5 - Foundation-Sec Threat Reasoning")
     parser.add_argument("--dataset", choices=["IoMT-TrafficData", "MedSec-25", "all"], default="all")
     parser.add_argument("--backend", choices=["offline", "huggingface", "api"], default="offline")
-    parser.add_argument("--model-id", default="cisco/Foundation-Sec-8B-Instruct")
+    parser.add_argument("--model-id", default="fdtn-ai/Foundation-Sec-8B-Instruct")
+    parser.add_argument("--samples", type=int, default=100)
     args = parser.parse_args()
-
-    print("=" * 65)
-    print("M5 - Foundation-Sec-8B-Instruct Threat Reasoning Layer")
-    print("=" * 65)
-    print(f"Backend:  {args.backend}")
-    print(f"Model ID: {args.model_id}")
-
     datasets = ["IoMT-TrafficData", "MedSec-25"] if args.dataset == "all" else [args.dataset]
     for ds in datasets:
-        process_dataset_reasoning(
-            dataset_name=ds,
-            backend=args.backend,
-            model_id=args.model_id
-        )
-
-    print("\n" + "=" * 65)
-    print("ALL DATASETS PROCESSED SUCCESSFULLY BY FOUNDATION-SEC!")
-    print("=" * 65)
+        process_dataset_reasoning(ds, args.backend, args.model_id, args.samples)
 
 
 if __name__ == "__main__":

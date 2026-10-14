@@ -44,8 +44,8 @@ REASONING_DIR = os.path.join(PROJECT_ROOT, "results", "reasoning")
 def run_pipeline(
     dataset_name: str,
     backend: str = "offline",
-    max_samples: int = 25,
-    model_id: str = "cisco/Foundation-Sec-8B-Instruct"
+    max_samples: int = 100,
+    model_id: str = "fdtn-ai/Foundation-Sec-8B-Instruct"
 ):
     print("\n" + "=" * 70)
     print(f"  RUNNING FOUNDATION-SEC PIPELINE: {dataset_name}")
@@ -87,20 +87,39 @@ def run_pipeline(
     print("\n" + "-" * 70)
     print(f"  PERFORMANCE & REASONING SUMMARY: {dataset_name}")
     print("-" * 70)
-    attack_count = sum(1 for a in analyses if a.get("is_attack", True))
-    normal_count = sum(1 for a in analyses if not a.get("is_attack", True))
+    flagged = sum(1 for a in analyses if a.get("safe_verdict") == "Anomaly")
 
     print(f"Total Flows Reasoned:              {len(analyses)}")
-    print(f"  - Malicious Attack Flows:        {attack_count}")
-    print(f"  - Benign / Normal Clinical Flows: {normal_count}")
+    print(f"  - Flagged by SAFE (Anomaly):     {flagged}")
+    print(f"  - Normal according to SAFE:      {len(analyses) - flagged}")
     print(f"M4 Evidence Builder Latency:       {elapsed_m4:.3f} s")
     print(f"M5 Foundation-Sec Reasoning Time:  {elapsed_m5:.3f} s")
     print(f"Average Inference Latency / Flow:  {avg_latency_ms:.2f} ms")
     print(f"End-to-End Pipeline Latency:       {total_time:.3f} s")
 
+    # Measured timings (read by the M7 evaluator)
+    timing = {
+        "dataset": dataset_name,
+        "backend": backend,
+        "flows": len(analyses),
+        "m4_evidence_builder_s": round(elapsed_m4, 4),
+        "m5_reasoning_s": round(elapsed_m5, 4),
+        "m5_mean_latency_ms_per_flow": round(avg_latency_ms, 3),
+        "m4_m5_total_s": round(total_time, 4),
+        "measured_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with open(os.path.join(REASONING_DIR, dataset_name, "pipeline_timing.json"), "w", encoding="utf-8") as f:
+        json.dump(timing, f, indent=2)
+
     # Load summary json for verification
     with open(saved_artefacts["summary"], "r", encoding="utf-8") as f:
         summary_data = json.load(f)
+
+    ev = summary_data.get("evaluation", {})
+    print("\n[Evaluation vs ground truth]")
+    for key in ["attribution_accuracy_percent", "attack_mitigation_coverage_percent",
+                "missed_attack_rate_percent", "false_mitigation_rate_percent", "llm_valid_output_percent"]:
+        print(f"  - {key:<38}: {ev.get(key)}")
 
     print("\n[MITRE ATT&CK Attribution Coverage]")
     for tech, count in summary_data["mitre_techniques_distribution"].items():
@@ -129,8 +148,8 @@ def main():
     parser = argparse.ArgumentParser(description="AI SOC Assistant - Foundation-Sec Reasoning Pipeline")
     parser.add_argument("--dataset", choices=["IoMT-TrafficData", "MedSec-25", "all"], default="all")
     parser.add_argument("--backend", choices=["offline", "huggingface", "api"], default="offline")
-    parser.add_argument("--samples", type=int, default=25, help="Number of evidence flows to reason over")
-    parser.add_argument("--model-id", default="cisco/Foundation-Sec-8B-Instruct")
+    parser.add_argument("--samples", type=int, default=100, help="Number of evidence flows to reason over")
+    parser.add_argument("--model-id", default="fdtn-ai/Foundation-Sec-8B-Instruct")
     args = parser.parse_args()
 
     print("=" * 70)
@@ -154,10 +173,10 @@ def main():
         results.append(res)
 
     print("\n" + "=" * 70)
-    print("  ALL DATASETS PROCESSED SUCCESSFULLY BY FOUNDATION-SEC!")
+    print("  ALL DATASETS PROCESSED (M4 + M5)")
     print("=" * 70)
     for r in results:
-        print(f"  Dataset: {r['dataset']:<20} | Flagged Flows: {r['total_analyzed']} | Avg Latency: {r['avg_latency_ms']:.2f} ms")
+        print(f"  Dataset: {r['dataset']:<20} | Flows: {r['total_analyzed']} | Avg Latency: {r['avg_latency_ms']:.2f} ms")
     print("=" * 70 + "\n")
 
 
