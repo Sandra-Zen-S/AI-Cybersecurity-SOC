@@ -2,6 +2,8 @@
 
 An AI-driven intrusion detection, threat reasoning, and automated mitigation pipeline for SDN-enabled Internet of Medical Things (IoMT) networks.
 
+Members: Sandrazen S, Arjjitha S, Abhinav Yarramsetti
+
 ## Project Overview
 
 This project investigates an integrated cybersecurity pipeline that combines:
