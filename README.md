@@ -26,7 +26,7 @@ IoMT Clinical Network Traffic (Infusion Pumps, PACS, EHR, Telemetry)
                         ↓
             M2: WOA Feature Selection (45-56% Dimensionality Reduction)
                         ↓
-            M3: SAFE Self-Supervised Anomaly Detection (MSE Anomaly Scoring)
+            M3: SAFE-inspired Masked Autoencoder (reconstruction or latent-LOF scoring)
                         ↓
             M4: Threat Evidence Builder (Standardized Telemetry JSON)
                         ↓
@@ -43,6 +43,10 @@ IoMT Clinical Network Traffic (Infusion Pumps, PACS, EHR, Telemetry)
 
 ```text
 AI-Cybersecurity-SOC/
+├── notebooks/
+│   └── foundation_sec_colab.ipynb   # Google Colab run of Foundation-Sec-8B (M5)
+├── foundation_sec_results/
+│   └── reasoning/          # Foundation-Sec-8B outputs from Colab (both datasets)
 ├── data/
 │   └── processed/          # Preprocessed datasets (IoMT-TrafficData, MedSec-25)
 ├── src/
@@ -90,6 +94,22 @@ python -m src.reasoning.run_reasoning
 # Or run with specific backend (offline, huggingface, api)
 python -m src.reasoning.run_reasoning --dataset IoMT-TrafficData --backend offline
 ```
+
+**Running the real Foundation-Sec-8B model (Google Colab):**
+
+The 8B model runs 4-bit quantised (Q4_K_M) through Ollama on a free Colab T4 GPU. Open `notebooks/foundation_sec_colab.ipynb`, set the runtime to T4 GPU, and run the cells top to bottom. The notebook clones this repository, uploads each dataset's `threat_evidence.json`, starts Ollama, runs both datasets (100 flows each, about 18 s per flow) and downloads `foundation_sec_results.zip`.
+
+The outputs from that run are stored in `foundation_sec_results/reasoning/<dataset>/`. The M6 and M7 stages read from `results/reasoning/<dataset>/`, so copy them there before running them:
+
+```bash
+# Mac / Linux
+mkdir -p results && cp -r foundation_sec_results/reasoning results/
+
+# Windows (cmd)
+xcopy foundation_sec_results\reasoning results\reasoning /E /I /Y
+```
+
+The `results/` folder is git-ignored, so the Foundation-Sec outputs are kept in `foundation_sec_results/`. The reasoning step has a configurable timeout (`FOUNDATION_SEC_TIMEOUT`, default 900 s) so slow answers do not silently fall back to the rule engine.
 
 **Output Artefacts (`results/reasoning/<dataset>/`):**
 - `threat_evidence.json`: Standardized M4 threat evidence payload.
