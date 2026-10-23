@@ -1,0 +1,55 @@
+{
+    "dataset": "MedSec-25",
+    "generated_at": "2026-10-18T12:57:07.240275+00:00",
+    "reasoning_backend": "api",
+    "total_incidents": 100,
+    "severity_distribution": {
+        "INFORMATIONAL": 30,
+        "LOW": 47,
+        "MEDIUM": 21,
+        "HIGH": 2
+    },
+    "mitre_tactics_distribution": {
+        "None (Benign)": 30,
+        "None": 18,
+        "Discovery": 33,
+        "Reconnaissance": 4,
+        "Exfiltration": 5,
+        "Execution": 3,
+        "Command and Control": 7
+    },
+    "mitre_techniques_distribution": {
+        "None - None": 48,
+        "T1046 - Network Service Scanning": 30,
+        "T1083 - System Network Configuration Discovery": 1,
+        "T1593 - Scan Network": 2,
+        "T1041 - Exfiltration Over C2 Channel": 4,
+        "T1059 - Command and Scripting Interpreter": 3,
+        "T1048 - Exfiltration Over Alternative Protocol": 1,
+        "T1071 - Application Layer Protocol": 6,
+        "T1595 - Network Service Scanning": 2,
+        "T1095 - Non-Application Layer Protocol": 1,
+        "T1046 - Network Service Discovery": 2
+    },
+    "sdn_mitigation_actions": {
+        "ALLOW_FLOW": 48,
+        "RATE_LIMIT": 51,
+        "BLOCK_FLOW": 1
+    },
+    "evaluation": {
+        "flows_analysed": 100,
+        "ground_truth_attacks": 97,
+        "ground_truth_benign": 3,
+        "attacks_flagged_by_safe": 50,
+        "attribution_scored_flows": 50,
+        "attribution_accuracy_percent": 4.0,
+        "attack_mitigation_coverage_percent": 53.61,
+        "missed_attack_rate_percent": 46.39,
+        "false_mitigation_rate_percent": 0.0,
+        "benign_flows_restricted": 0,
+        "llm_valid_output_percent": 100.0,
+        "fallback_used_count": 0,
+        "mean_reasoning_latency_ms": 18311.735,
+        "notes": "Attribution accuracy is technique-level (sub-techniques ignored) on ground-truth attacks that SAFE flagged and whose label has a technique in the knowledge base."
+    }
+}

@@ -855,7 +855,7 @@ class FoundationSecReasoner:
         payload = json.dumps({"model": self.model_id, "messages": messages,
                               "temperature": 0, "max_tokens": 700}).encode("utf-8")
         req = urllib.request.Request(self.api_url, data=payload, headers=headers)
-        with urllib.request.urlopen(req, timeout=180) as resp:
+        with urllib.request.urlopen(req, timeout=float(os.environ.get("FOUNDATION_SEC_TIMEOUT", "900"))) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         return data["choices"][0]["message"]["content"]
 

@@ -1,0 +1,47 @@
+{
+    "dataset": "IoMT-TrafficData",
+    "generated_at": "2026-10-18T12:22:50.135389+00:00",
+    "reasoning_backend": "api",
+    "total_incidents": 100,
+    "severity_distribution": {
+        "INFORMATIONAL": 39,
+        "LOW": 31,
+        "MEDIUM": 30
+    },
+    "mitre_tactics_distribution": {
+        "Reconnaissance": 33,
+        "None (Benign)": 32,
+        "Discovery": 30,
+        "Exfiltration": 2,
+        "None": 3
+    },
+    "mitre_techniques_distribution": {
+        "T1595 - Network Service Scanning": 31,
+        "None - None": 37,
+        "T1046 - Network Service Scanning": 25,
+        "T1046 - Network Service Discovery": 2,
+        "T1041 - Exfiltration Over C2 Channel": 1,
+        "T1083 - File and Directory Discovery": 3,
+        "T1048 - Exfiltration Over Alternative Protocol": 1
+    },
+    "sdn_mitigation_actions": {
+        "ALLOW_FLOW": 42,
+        "RATE_LIMIT": 58
+    },
+    "evaluation": {
+        "flows_analysed": 100,
+        "ground_truth_attacks": 50,
+        "ground_truth_benign": 50,
+        "attacks_flagged_by_safe": 50,
+        "attribution_scored_flows": 50,
+        "attribution_accuracy_percent": 10.0,
+        "attack_mitigation_coverage_percent": 100.0,
+        "missed_attack_rate_percent": 0.0,
+        "false_mitigation_rate_percent": 16.0,
+        "benign_flows_restricted": 8,
+        "llm_valid_output_percent": 100.0,
+        "fallback_used_count": 0,
+        "mean_reasoning_latency_ms": 17904.446,
+        "notes": "Attribution accuracy is technique-level (sub-techniques ignored) on ground-truth attacks that SAFE flagged and whose label has a technique in the knowledge base."
+    }
+}
